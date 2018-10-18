@@ -15,10 +15,13 @@
 #define NUM_LEDS 50
 #define PIN D8
 #define COLOR_ORDER RGB
+#define INFOPort 50050
+#define DISRUPTPort 50060
 #define BUCKETS 100
 #define STRANDS 15
 #define WIFI_TIMEOUT 20000
 #define INFO_TIMEOUT 10000
+#define DISRUPTIONS 5
 
 CRGB leds[NUM_LEDS];
 MPU6050 accelgyro;
@@ -41,8 +44,9 @@ const char* password = "chaartdev";     // The password of the Wi-Fi network
 #define MAX_DISTURBANCE 1200.0
 #define MIN_BRIGHTNESS 50.0
 #define MAX_BRIGHTNESS 255.0
+#define MIN_DISRUPTION 600.0
+#define DISRUPTION_DELAY 5000
 
-#define INFOPort 50050
 
 WiFiUDP Udp;
 
@@ -56,6 +60,11 @@ typedef struct Strand {
   Location location;
 } Strand;
 
+typedef struct Disruption {
+  long time;
+  uint8_t level;
+} Disruption;
+
 uint32_t myMac = 0;
 Strand distanceTable[STRANDS];
 Location myLocation;
@@ -65,6 +74,8 @@ int avgPtr = 0;
 float avg = 500.0;
 double instDisturbance = 0.0;
 double disturbance = 0.0;
+Disruption disruptions[DISRUPTIONS];
+int nextDisruption = 0;
 
 float distance(Location loc1, Location loc2) {
   float dx = loc1.x - loc2.x;
@@ -72,7 +83,21 @@ float distance(Location loc1, Location loc2) {
   return sqrt(dx*dx + dy*dy);
 }
 
-bool connectToWifi(){
+void setupAccelerometer() {
+  Wire.begin();
+
+  // initialize device
+  Serial.println("Initializing I2C devices...");
+  accelgyro.initialize();
+  delay(100);
+
+  // verify connection
+  Serial.println("Testing device connections...");
+  Serial.println(accelgyro.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
+
+}
+
+bool connectToWifi() {
   WiFi.begin(ssid, password);             // Connect to the network
 
   Serial.print("Connecting to ");
@@ -101,6 +126,54 @@ bool connectToWifi(){
   return false;
 }
 
+bool retrieveInfoPacket() {
+  Udp.begin(INFOPort);
+  long waitStart = millis();
+  int packetSize = 0;
+  for (packetSize = Udp.parsePacket(); packetSize == 0 && millis() - waitStart < INFO_TIMEOUT; packetSize = Udp.parsePacket()) {
+    delay(10);
+  }
+
+  if (packetSize == 0) {
+    Serial.println("Info Timeout");
+    return true;
+  }
+
+  Udp.read((char *) &distanceTable, sizeof(distanceTable));
+  Udp.stop();
+
+  for (int i=0; i<STRANDS; i++) {
+    if (myMac == distanceTable[i].macAddress) {
+      myLocation = distanceTable[i].location;
+      Serial.printf("my location: %f, %f\n", distanceTable[i].location.x, distanceTable[i].location.y);
+    }
+  }
+  for (int i=0; i<STRANDS; i++) {
+    Serial.printf("%6x: %f, %f d: %f\n", distanceTable[i].macAddress, distanceTable[i].location.x, distanceTable[i].location.y, distance(myLocation, distanceTable[i].location));
+  }
+  Serial.println();
+
+  return false;
+}
+
+void readDisruption() {
+  int packetSize = Udp.parsePacket();
+  if (packetSize == 0) {
+    return;
+  }
+
+  uint8_t level;
+  Udp.read((char *) &level, sizeof(level));
+
+  int disruptIndex = (nextDisruption++) % DISRUPTIONS;
+  disruptions[disruptIndex].time = millis();
+  disruptions[disruptIndex].level = level;
+
+  for (int i=0; i<DISRUPTIONS; i++) {
+    Serial.printf("disrupt[%d]: %d, %d\n", i, disruptions[i].time, disruptions[i].level);
+  }
+}
+
 void setup() {
   FastLED.addLeds<WS2811, PIN>(leds, NUM_LEDS);
 
@@ -109,16 +182,12 @@ void setup() {
 
   pinMode(0, INPUT);
   for (int i=0; i<BUCKETS; i++) samples[i] = 500;
+  for (int i=0; i<DISRUPTIONS; i++) {
+    disruptions[i].time = 0;
+    disruptions[i].level = 0;
+  }
 
-  Wire.begin();
-
-  // initialize device
-  Serial.println("Initializing I2C devices...");
-  accelgyro.initialize();
-
-  // verify connection
-  Serial.println("Testing device connections...");
-  Serial.println(accelgyro.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
+  setupAccelerometer();
 
   // determine macAddress as a 32 bit int
   uint8_t macAddress[6] = {0};
@@ -139,35 +208,16 @@ void setup() {
     return;
   }
 
-  // Retrieve info packet
-  Udp.begin(INFOPort);
-  long waitStart = millis();
-  int packetSize = 0;
-  for (packetSize = Udp.parsePacket(); packetSize == 0 && millis() - waitStart < INFO_TIMEOUT; packetSize = Udp.parsePacket()) {
-    delay(10);
-  }
-
-  if (packetSize == 0) {
-    Serial.println("Info Timeout");
+  if (retrieveInfoPacket()) {
     return;
   }
 
-  Udp.read((char *) &distanceTable, sizeof(distanceTable));
-  Udp.stop();
-
-  for (int i=0; i<STRANDS; i++) {
-    if (myMac == distanceTable[i].macAddress) {
-      myLocation = distanceTable[i].location;
-      Serial.printf("my location: %f, %f\n", distanceTable[i].location.x, distanceTable[i].location.y);
-    }
-  }
-  for (int i=0; i<STRANDS; i++) {
-    Serial.printf("%d: %f, %f d: %f\n", distanceTable[i].macAddress, distanceTable[i].location.x, distanceTable[i].location.y, distance(myLocation, distanceTable[i].location));
-  }
-  Serial.println();
+  Udp.begin(DISRUPTPort);
 }
 
 void loop() {
+  readDisruption();
+
   int16_t ax, ay, az, gx, gy, gz;
   accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
