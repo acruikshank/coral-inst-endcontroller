@@ -4,53 +4,35 @@
  */
 
 #include <ESP8266WiFi.h>
+#include <WiFiUDP.h>
 #include <Arduino.h>
 #include "I2Cdev.h"
 #include "MPU6050.h"
 #include "Wire.h"
+#include "FastLED.h"
 
 #define FASTLED_ESP8266_RAW_PIN_ORDER
-#include "FastLED.h"
 #define NUM_LEDS 50
 #define PIN D8
 #define COLOR_ORDER RGB
+#define BUCKETS 100
+#define STRANDS 15
+#define WIFI_TIMEOUT 20000
+#define INFO_TIMEOUT 10000
 
 CRGB leds[NUM_LEDS];
 MPU6050 accelgyro;
 
 /* Set these to your desired AP credentials. */
-const char* ssid     = "Floor5GIG";         // The SSID (name) of the Wi-Fi network you want to connect to
-const char* password = "innovation";     // The password of the Wi-Fi network
-int port = 23;
+const char* ssid     = "anthazoa";         // The SSID (name) of the Wi-Fi network you want to connect to
+const char* password = "chaartdev";     // The password of the Wi-Fi network
 
-// ansi stuff, could always use printf instead of concat
-String ansiSAV  = "\033[s"; // save cursor
-String ansiRET  = "\033[u"; // return
 
-String ansiESC  = "\033[2J"; // esc
-String ansiCL   = "\033[K";
-
-String ansiEND  = "\033[0m";   // closing tag for styles
-String ansiBOLD = "\033[1m";
-
-String ansiBLUF = "\033[34m"; // blue foreground
-
-// declare telnet server (do NOT put in setup())
-WiFiServer TelnetServer(port);
-WiFiClient Telnet;
-
-#define BUCKETS 100
 #define BUCKET_WEIGHT 0.01
 #define DAMPNING .95
 #define INERTIA .10
 #define SCALE 20
 #define GAIN .008
-float samples[BUCKETS];
-int avgPtr = 0;
-float avg = 500.0;
-double instDisturbance = 0.0;
-double disturbance = 0.0;
-
 #define MIN_HUE 140.0
 #define MAX_HUE 0.0
 #define SCINT_AMP 10.0
@@ -60,36 +42,53 @@ double disturbance = 0.0;
 #define MIN_BRIGHTNESS 50.0
 #define MAX_BRIGHTNESS 255.0
 
-void handleTelnet(){
-  if (TelnetServer.hasClient()){
-  	// client is connected
-    if (!Telnet || !Telnet.connected()){
-      if(Telnet) Telnet.stop();          // client disconnected
-      Telnet = TelnetServer.available(); // ready for new client
-    } else {
-      Telnet.print("Z: ");
-      TelnetServer.available().stop();  // have client, block new conections
-    }
-  }
+#define INFOPort 50050
 
-  if (Telnet && Telnet.connected() && Telnet.available()){
-    // client input processing
-    while(Telnet.available())
-      Serial.write(Telnet.read()); // pass through
-      // do other stuff with client input here
-  }
+WiFiUDP Udp;
+
+typedef struct Location {
+  float x;
+  float y;
+} Location;
+
+typedef struct Strand {
+  uint32_t macAddress;
+  Location location;
+} Strand;
+
+uint32_t myMac = 0;
+Strand distanceTable[STRANDS];
+Location myLocation;
+
+float samples[BUCKETS];
+int avgPtr = 0;
+float avg = 500.0;
+double instDisturbance = 0.0;
+double disturbance = 0.0;
+
+float distance(Location loc1, Location loc2) {
+  float dx = loc1.x - loc2.x;
+  float dy = loc1.y - loc2.y;
+  return sqrt(dx*dx + dy*dy);
 }
 
-void startAP(){
+bool connectToWifi(){
   WiFi.begin(ssid, password);             // Connect to the network
 
   Serial.print("Connecting to ");
   Serial.print(ssid); Serial.println(" ...");
 
+  long waitStart = millis();
+
   int i = 0;
-  while (WiFi.status() != WL_CONNECTED) { // Wait for the Wi-Fi to connect
+  while (WiFi.status() != WL_CONNECTED && millis() - waitStart < WIFI_TIMEOUT) { // Wait for the Wi-Fi to connect
     delay(1000);
     Serial.print(++i); Serial.print(' ');
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Timeout connecting to WiFi");
+    return true;
   }
 
   Serial.println('\n');
@@ -99,25 +98,17 @@ void startAP(){
 
   delay(4000); // ap delay
 
-  TelnetServer.begin();
-  Serial.print("Starting telnet server on port " + (String)port);
-
-  // TelnetServer.setNoDelay(true); // ESP BUG ?
-  Serial.println();
-  delay(100);
+  return false;
 }
 
 void setup() {
   FastLED.addLeds<WS2811, PIN>(leds, NUM_LEDS);
 
   Serial.begin(115200);
-  // Serial.setDebugOutput(true);
   delay(1000); // serial delay
 
   pinMode(0, INPUT);
   for (int i=0; i<BUCKETS; i++) samples[i] = 500;
-
-  startAP();
 
   Wire.begin();
 
@@ -128,12 +119,55 @@ void setup() {
   // verify connection
   Serial.println("Testing device connections...");
   Serial.println(accelgyro.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
-  delay(100);
+
+  // determine macAddress as a 32 bit int
+  uint8_t macAddress[6] = {0};
+
+  WiFi.macAddress(&macAddress[0]);
+  for (int i=0; i<6; i++) {
+    Serial.printf("%d:", macAddress[i]);
+  }
+  Serial.println();
+
+  for(int i=3; i < 6; i++) {
+    myMac |= (macAddress[i] << (8*(5-i)));
+  }
+  Serial.printf("mac: %x\n", myMac);
+
+  // connect to wifi
+  if (connectToWifi()) {
+    return;
+  }
+
+  // Retrieve info packet
+  Udp.begin(INFOPort);
+  long waitStart = millis();
+  int packetSize = 0;
+  for (packetSize = Udp.parsePacket(); packetSize == 0 && millis() - waitStart < INFO_TIMEOUT; packetSize = Udp.parsePacket()) {
+    delay(10);
+  }
+
+  if (packetSize == 0) {
+    Serial.println("Info Timeout");
+    return;
+  }
+
+  Udp.read((char *) &distanceTable, sizeof(distanceTable));
+  Udp.stop();
+
+  for (int i=0; i<STRANDS; i++) {
+    if (myMac == distanceTable[i].macAddress) {
+      myLocation = distanceTable[i].location;
+      Serial.printf("my location: %f, %f\n", distanceTable[i].location.x, distanceTable[i].location.y);
+    }
+  }
+  for (int i=0; i<STRANDS; i++) {
+    Serial.printf("%d: %f, %f d: %f\n", distanceTable[i].macAddress, distanceTable[i].location.x, distanceTable[i].location.y, distance(myLocation, distanceTable[i].location));
+  }
+  Serial.println();
 }
 
 void loop() {
-  handleTelnet();
-
   int16_t ax, ay, az, gx, gy, gz;
   accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
@@ -145,11 +179,6 @@ void loop() {
   avg += (nextSample - samples[avgPtr])*BUCKET_WEIGHT;
   samples[avgPtr] = nextSample;
   avgPtr = (avgPtr + 1) % BUCKETS;
-
-  Telnet.println(ansiSAV + (String)disturbance + ansiCL);
-  Telnet.print(ansiBLUF + ansiBOLD);
-  for (int i=0; SCALE*i < disturbance ; i++) Telnet.print("*");
-  Telnet.print(ansiCL + ansiEND + "\033[1A\033[99D");
 
   double cDisturbance = min(MAX_DISTURBANCE, max(0.0, disturbance)) / MAX_DISTURBANCE;
   uint8_t brightness = (uint8_t) (MIN_BRIGHTNESS + sqrt(cDisturbance) * (MAX_BRIGHTNESS - MIN_BRIGHTNESS));
