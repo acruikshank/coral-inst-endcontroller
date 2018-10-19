@@ -65,10 +65,34 @@ typedef struct Disruption {
   float distance;
 } Disruption;
 
+typedef struct Info {
+  Strand distanceTable[STRANDS];
+  float bucketWeight;
+  float dampning;
+  float inertia;
+  float scale;
+  float gain;
+  float minHue;
+  float maxHue;
+  float scintAmp;
+  float scintTFreq;
+  float scintSFreq;
+  double maxDisturbance;
+  float minBrightness;
+  float maxBrightness;
+  float minDisruption;
+  uint32_t disruptionDelay;
+  float disruptVelocity;
+  float disruptAmp;
+  float disruptDamping;
+  float disruptFreq;
+  uint32_t disruptDone;
+} Info;
+
 WiFiUDP Udp;
 
 uint32_t myMac = 0;
-Strand distanceTable[STRANDS];
+Info systemInfo;
 Location myLocation;
 
 float samples[BUCKETS];
@@ -165,19 +189,42 @@ bool retrieveInfoPacket() {
     return true;
   }
 
-  Udp.read((char *) &distanceTable, sizeof(distanceTable));
+  Udp.read((char *) &systemInfo, sizeof(Info));
   Udp.stop();
 
   for (int i=0; i<STRANDS; i++) {
-    if (myMac == distanceTable[i].macAddress) {
-      myLocation = distanceTable[i].location;
-      Serial.printf("my location: %f, %f\n", distanceTable[i].location.x, distanceTable[i].location.y);
+    if (myMac == systemInfo.distanceTable[i].macAddress) {
+      myLocation = systemInfo.distanceTable[i].location;
+      Serial.printf("my location: %f, %f\n", systemInfo.distanceTable[i].location.x, systemInfo.distanceTable[i].location.y);
     }
   }
   for (int i=0; i<STRANDS; i++) {
-    Serial.printf("%6x: %f, %f d: %f\n", distanceTable[i].macAddress, distanceTable[i].location.x, distanceTable[i].location.y, distance(myLocation, distanceTable[i].location));
+    Serial.printf("%6x: %f, %f d: %f\n", systemInfo.distanceTable[i].macAddress, systemInfo.distanceTable[i].location.x,
+                  systemInfo.distanceTable[i].location.y, distance(myLocation, systemInfo.distanceTable[i].location));
   }
   Serial.println();
+
+  Serial.printf("bucketWeight: %f\n", systemInfo.bucketWeight);
+  Serial.printf("dampning: %f\n", systemInfo.dampning);
+  Serial.printf("inertia: %f\n", systemInfo.inertia);
+  Serial.printf("scale: %f\n", systemInfo.scale);
+  Serial.printf("gain: %f\n", systemInfo.gain);
+  Serial.printf("minHue: %f\n", systemInfo.minHue);
+  Serial.printf("maxHue: %f\n", systemInfo.maxHue);
+  Serial.printf("scintAmp: %f\n", systemInfo.scintAmp);
+  Serial.printf("scintTFreq: %f\n", systemInfo.scintTFreq);
+  Serial.printf("scintSFreq: %f\n", systemInfo.scintSFreq);
+  Serial.printf("maxDisturbance: %f\n", systemInfo.maxDisturbance);
+  Serial.printf("minBrightness: %f\n", systemInfo.minBrightness);
+  Serial.printf("maxBrightness: %f\n", systemInfo.maxBrightness);
+  Serial.printf("minDisruption: %f\n", systemInfo.minDisruption);
+  Serial.printf("disruptionDelay: %d\n", systemInfo.disruptionDelay);
+  Serial.printf("disruptVelocity: %f\n", systemInfo.disruptVelocity);
+  Serial.printf("disruptAmp: %f\n", systemInfo.disruptAmp);
+  Serial.printf("disruptDamping: %f\n", systemInfo.disruptDamping);
+  Serial.printf("disruptFreq: %f\n", systemInfo.disruptFreq);
+  Serial.printf("disruptDone: %d\n", systemInfo.disruptDone);
+
 
   return false;
 }
@@ -199,8 +246,8 @@ void readDisruption() {
 
   // identify sender and compute distance
   for (int i=0; i<STRANDS; i++) {
-    if (disruption.from = distanceTable[i].macAddress) {
-      disruption.distance = distance(myLocation, distanceTable[i].location);
+    if (disruption.from == systemInfo.distanceTable[i].macAddress) {
+      disruption.distance = distance(myLocation, systemInfo.distanceTable[i].location);
       break;
     }
   }
@@ -214,14 +261,14 @@ void readDisruption() {
 }
 
 void maybeSendDisruption() {
-  if (disturbance < MIN_DISRUPTION) return;
-  if (millis() - lastDisruption < DISRUPTION_DELAY) return;
+  if (disturbance < systemInfo.minDisruption) return;
+  if (millis() - lastDisruption < systemInfo.disruptionDelay) return;
   lastDisruption = millis();
 
   Disruption disruption;
   disruption.from = myMac;
   disruption.time = 0;
-  disruption.level = (uint8_t) ((255*min(MAX_DISTURBANCE, disturbance)) / MAX_DISTURBANCE);
+  disruption.level = (uint8_t) ((255*min(systemInfo.maxDisturbance, disturbance)) / systemInfo.maxDisturbance);
   Udp.beginPacket("192.168.0.255", DISRUPTPort);
   delay(5);
   Udp.write((char *) &disruption, sizeof(Disruption));
@@ -231,6 +278,28 @@ void maybeSendDisruption() {
 
 void setup() {
   FastLED.addLeds<WS2811, PIN>(leds, NUM_LEDS);
+
+  // default info
+  systemInfo.bucketWeight = BUCKET_WEIGHT;
+  systemInfo.dampning = DAMPNING;
+  systemInfo.inertia = INERTIA;
+  systemInfo.scale = SCALE;
+  systemInfo.gain = GAIN;
+  systemInfo.minHue = MIN_HUE;
+  systemInfo.maxHue = MAX_HUE;
+  systemInfo.scintAmp = SCINT_AMP;
+  systemInfo.scintTFreq = SCINT_T_FREQ;
+  systemInfo.scintSFreq = SCINT_S_FREQ;
+  systemInfo.maxDisturbance = MAX_DISTURBANCE;
+  systemInfo.minBrightness = MIN_BRIGHTNESS;
+  systemInfo.maxBrightness = MAX_BRIGHTNESS;
+  systemInfo.minDisruption = MIN_DISRUPTION;
+  systemInfo.disruptionDelay = DISRUPTION_DELAY;
+  systemInfo.disruptVelocity = DISRUPT_VELOCITY;
+  systemInfo.disruptAmp = DISRUPT_AMP;
+  systemInfo.disruptDamping = DISRUPT_DAMPING;
+  systemInfo.disruptFreq = DISRUPT_FREQ;
+  systemInfo.disruptDone = DISRUPT_DONE;
 
   Serial.begin(115200);
   delay(1000); // serial delay
@@ -261,8 +330,8 @@ void setup() {
 }
 
 float dampedSin(long time, float distance) {
-  float x = DISRUPT_VELOCITY*time - distance;
-  return x > 0 ? -DISRUPT_AMP*exp(-DISRUPT_DAMPING*x)*sin(DISRUPT_FREQ*x) : 0;
+  float x = systemInfo.disruptVelocity*time - distance;
+  return x > 0 ? -systemInfo.disruptAmp*exp(-systemInfo.disruptDamping*x)*sin(systemInfo.disruptFreq*x) : 0;
 }
 
 void loop() {
@@ -275,24 +344,24 @@ void loop() {
   int16_t ax, ay, az, gx, gy, gz;
   accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
-  float nextSample = GAIN * max(az,ay);
-  instDisturbance *= DAMPNING;
+  float nextSample = systemInfo.gain * max(az,ay);
+  instDisturbance *= systemInfo.dampning;
   instDisturbance += abs(nextSample - avg);
-  disturbance += INERTIA*(instDisturbance - disturbance);
+  disturbance += systemInfo.inertia*(instDisturbance - disturbance);
 
   maybeSendDisruption();
 
-  avg += (nextSample - samples[avgPtr])*BUCKET_WEIGHT;
+  avg += (nextSample - samples[avgPtr])*systemInfo.bucketWeight;
   samples[avgPtr] = nextSample;
   avgPtr = (avgPtr + 1) % BUCKETS;
 
-  double cDisturbance = min(MAX_DISTURBANCE, max(0.0, disturbance)) / MAX_DISTURBANCE;
-  uint8_t brightness = (uint8_t) (MIN_BRIGHTNESS + sqrt(cDisturbance) * (MAX_BRIGHTNESS - MIN_BRIGHTNESS));
+  double cDisturbance = min(systemInfo.maxDisturbance, max(0.0, disturbance)) / systemInfo.maxDisturbance;
+  uint8_t brightness = (uint8_t) (systemInfo.minBrightness + sqrt(cDisturbance) * (systemInfo.maxBrightness - systemInfo.minBrightness));
 
   float disruptEffect = 0.0;
   long now = millis();
   for (int i=0; i<DISRUPTIONS; i++) {
-    if (now - disruptions[i].time < DISRUPT_DONE) {
+    if (now - disruptions[i].time < systemInfo.disruptDone) {
       disruptEffect += dampedSin(now - disruptions[i].time, disruptions[i].distance);
     }
   }
@@ -304,8 +373,8 @@ void loop() {
   }
 
   for(int i = 0; i < NUM_LEDS; i++) {
-    double scintHue = MIN_HUE + SCINT_AMP * sin(SCINT_T_FREQ*millis() + SCINT_S_FREQ*i);
-    uint8_t hue = (uint8_t) (scintHue + cDisturbance * (MAX_HUE - MIN_HUE));
+    double scintHue = systemInfo.minHue + systemInfo.scintAmp * sin(systemInfo.scintTFreq*millis() + systemInfo.scintSFreq*i);
+    uint8_t hue = (uint8_t) (scintHue + cDisturbance * (systemInfo.maxHue - systemInfo.minHue));
     leds[i] = CHSV(hue, 255, brightness);
   }
   FastLED.show();
