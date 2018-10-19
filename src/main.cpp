@@ -1,8 +1,3 @@
-/**
- * Arduino ESP8266 telnet server with some ansi experiments
- * @author: shawn_a
- */
-
 #include <ESP8266WiFi.h>
 #include <WiFiUDP.h>
 #include <Arduino.h>
@@ -19,9 +14,10 @@
 #define DISRUPTPort 50060
 #define BUCKETS 100
 #define STRANDS 15
-#define WIFI_TIMEOUT 20000
+#define WIFI_TIMEOUT 30000
 #define INFO_TIMEOUT 10000
-#define DISRUPTIONS 5
+#define DISRUPTIONS 15
+#define ACC_RESET D5
 
 CRGB leds[NUM_LEDS];
 MPU6050 accelgyro;
@@ -29,7 +25,6 @@ MPU6050 accelgyro;
 /* Set these to your desired AP credentials. */
 const char* ssid     = "anthazoa";         // The SSID (name) of the Wi-Fi network you want to connect to
 const char* password = "chaartdev";     // The password of the Wi-Fi network
-
 
 #define BUCKET_WEIGHT 0.01
 #define DAMPNING .95
@@ -47,7 +42,6 @@ const char* password = "chaartdev";     // The password of the Wi-Fi network
 #define MIN_DISRUPTION 600.0
 #define DISRUPTION_DELAY 5000
 
-
 WiFiUDP Udp;
 
 typedef struct Location {
@@ -63,6 +57,7 @@ typedef struct Strand {
 typedef struct Disruption {
   long time;
   uint8_t level;
+  uint32_t from;
 } Disruption;
 
 uint32_t myMac = 0;
@@ -76,6 +71,7 @@ double instDisturbance = 0.0;
 double disturbance = 0.0;
 Disruption disruptions[DISRUPTIONS];
 int nextDisruption = 0;
+long lastDisruption = 0;
 
 float distance(Location loc1, Location loc2) {
   float dx = loc1.x - loc2.x;
@@ -84,6 +80,11 @@ float distance(Location loc1, Location loc2) {
 }
 
 void setupAccelerometer() {
+  digitalWrite(ACC_RESET, LOW);
+  delay(10);
+  digitalWrite(ACC_RESET, HIGH);
+  delay(100);
+
   Wire.begin();
 
   // initialize device
@@ -94,7 +95,25 @@ void setupAccelerometer() {
   // verify connection
   Serial.println("Testing device connections...");
   Serial.println(accelgyro.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
+}
 
+uint32_t computeMacAddress() {
+  uint32_t mac = 0;
+
+  // determine macAddress as a 32 bit int
+  uint8_t macAddress[6] = {0};
+
+  WiFi.macAddress(&macAddress[0]);
+  for (int i=0; i<6; i++) {
+    Serial.printf("%d:", macAddress[i]);
+  }
+  Serial.println();
+
+  for(int i=3; i < 6; i++) {
+    mac |= (macAddress[i] << (8*(5-i)));
+  }
+  Serial.printf("mac: %x\n", mac);
+  return mac;
 }
 
 bool connectToWifi() {
@@ -162,16 +181,38 @@ void readDisruption() {
     return;
   }
 
-  uint8_t level;
-  Udp.read((char *) &level, sizeof(level));
+  Disruption disruption;
+  Udp.read((char *) &disruption, sizeof(disruption));
 
-  int disruptIndex = (nextDisruption++) % DISRUPTIONS;
-  disruptions[disruptIndex].time = millis();
-  disruptions[disruptIndex].level = level;
+  // ignore our own disruptions
+  if (disruption.from == myMac) return;
 
+  // use our own clock time
+  disruption.time = millis();
+
+  // add to ring buffer
+  disruptions[(nextDisruption++) % DISRUPTIONS] = disruption;
+
+  // TODO: delete me
   for (int i=0; i<DISRUPTIONS; i++) {
-    Serial.printf("disrupt[%d]: %d, %d\n", i, disruptions[i].time, disruptions[i].level);
+    Serial.printf("disrupt[%d]: t: %d, l: %d, f: %6x\n", i, disruptions[i].time, disruptions[i].level, disruptions[i].from);
   }
+}
+
+void maybeSendDisruption() {
+  if (disturbance < MIN_DISRUPTION) return;
+  if (millis() - lastDisruption < DISRUPTION_DELAY) return;
+  lastDisruption = millis();
+
+  Disruption disruption;
+  disruption.from = myMac;
+  disruption.time = 0;
+  disruption.level = (uint8_t) ((255*min(MAX_DISTURBANCE, disturbance)) / MAX_DISTURBANCE);
+  Udp.beginPacket("192.168.0.255", DISRUPTPort);
+  delay(5);
+  Udp.write((char *) &disruption, sizeof(Disruption));
+  Udp.endPacket();
+  Udp.flush();
 }
 
 void setup() {
@@ -181,6 +222,8 @@ void setup() {
   delay(1000); // serial delay
 
   pinMode(0, INPUT);
+  pinMode(ACC_RESET, OUTPUT);
+  digitalWrite(ACC_RESET, HIGH);
   for (int i=0; i<BUCKETS; i++) samples[i] = 500;
   for (int i=0; i<DISRUPTIONS; i++) {
     disruptions[i].time = 0;
@@ -188,20 +231,7 @@ void setup() {
   }
 
   setupAccelerometer();
-
-  // determine macAddress as a 32 bit int
-  uint8_t macAddress[6] = {0};
-
-  WiFi.macAddress(&macAddress[0]);
-  for (int i=0; i<6; i++) {
-    Serial.printf("%d:", macAddress[i]);
-  }
-  Serial.println();
-
-  for(int i=3; i < 6; i++) {
-    myMac |= (macAddress[i] << (8*(5-i)));
-  }
-  Serial.printf("mac: %x\n", myMac);
+  myMac = computeMacAddress();
 
   // connect to wifi
   if (connectToWifi()) {
@@ -212,19 +242,26 @@ void setup() {
     return;
   }
 
+  // start listening to disruptions
   Udp.begin(DISRUPTPort);
 }
 
 void loop() {
   readDisruption();
 
+  if (!accelgyro.testConnection()) {
+    setupAccelerometer();
+  }
+
   int16_t ax, ay, az, gx, gy, gz;
   accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
-  float nextSample = GAIN * az;
+  float nextSample = GAIN * max(az,ay);
   instDisturbance *= DAMPNING;
   instDisturbance += abs(nextSample - avg);
   disturbance += INERTIA*(instDisturbance - disturbance);
+
+  maybeSendDisruption();
 
   avg += (nextSample - samples[avgPtr])*BUCKET_WEIGHT;
   samples[avgPtr] = nextSample;
