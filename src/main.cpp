@@ -41,8 +41,12 @@ const char* password = "chaartdev";     // The password of the Wi-Fi network
 #define MAX_BRIGHTNESS 255.0
 #define MIN_DISRUPTION 600.0
 #define DISRUPTION_DELAY 5000
+#define DISRUPT_VELOCITY 0.003
+#define DISRUPT_AMP 1.3
+#define DISRUPT_DAMPING 0.4
+#define DISRUPT_FREQ 2.0
+#define DISRUPT_DONE 10000
 
-WiFiUDP Udp;
 
 typedef struct Location {
   float x;
@@ -55,10 +59,13 @@ typedef struct Strand {
 } Strand;
 
 typedef struct Disruption {
-  long time;
   uint8_t level;
   uint32_t from;
+  long time;
+  float distance;
 } Disruption;
+
+WiFiUDP Udp;
 
 uint32_t myMac = 0;
 Strand distanceTable[STRANDS];
@@ -190,13 +197,20 @@ void readDisruption() {
   // use our own clock time
   disruption.time = millis();
 
+  // identify sender and compute distance
+  for (int i=0; i<STRANDS; i++) {
+    if (disruption.from = distanceTable[i].macAddress) {
+      disruption.distance = distance(myLocation, distanceTable[i].location);
+      break;
+    }
+  }
+
   // add to ring buffer
   disruptions[(nextDisruption++) % DISRUPTIONS] = disruption;
 
-  // TODO: delete me
-  for (int i=0; i<DISRUPTIONS; i++) {
-    Serial.printf("disrupt[%d]: t: %d, l: %d, f: %6x\n", i, disruptions[i].time, disruptions[i].level, disruptions[i].from);
-  }
+  // for (int i=0; i<DISRUPTIONS; i++) {
+  //   Serial.printf("disrupt[%d]: t: %d, l: %d, f: %6x\n", i, disruptions[i].time, disruptions[i].level, disruptions[i].from);
+  // }
 }
 
 void maybeSendDisruption() {
@@ -246,6 +260,11 @@ void setup() {
   Udp.begin(DISRUPTPort);
 }
 
+float dampedSin(long time, float distance) {
+  float x = DISRUPT_VELOCITY*time - distance;
+  return x > 0 ? -DISRUPT_AMP*exp(-DISRUPT_DAMPING*x)*sin(DISRUPT_FREQ*x) : 0;
+}
+
 void loop() {
   readDisruption();
 
@@ -269,6 +288,20 @@ void loop() {
 
   double cDisturbance = min(MAX_DISTURBANCE, max(0.0, disturbance)) / MAX_DISTURBANCE;
   uint8_t brightness = (uint8_t) (MIN_BRIGHTNESS + sqrt(cDisturbance) * (MAX_BRIGHTNESS - MIN_BRIGHTNESS));
+
+  float disruptEffect = 0.0;
+  long now = millis();
+  for (int i=0; i<DISRUPTIONS; i++) {
+    if (now - disruptions[i].time < DISRUPT_DONE) {
+      disruptEffect += dampedSin(now - disruptions[i].time, disruptions[i].distance);
+    }
+  }
+
+  if (disruptEffect > 0.0) {
+    brightness += (uint8_t) (disruptEffect*(255-brightness));
+  } else {
+    brightness = (uint8_t) ((1.0-disruptEffect)*brightness);
+  }
 
   for(int i = 0; i < NUM_LEDS; i++) {
     double scintHue = MIN_HUE + SCINT_AMP * sin(SCINT_T_FREQ*millis() + SCINT_S_FREQ*i);
